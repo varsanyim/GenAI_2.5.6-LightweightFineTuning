@@ -37,9 +37,12 @@ def secToHuman(elapsed_time):
     return f"{int(hours):02}:{int(minutes):02}:{seconds:.2f}"
 
 def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
+    logits, labels = eval_pred
+    if isinstance(logits, tuple):  # Ensure it's not a dictionary
+        logits = logits[0]
+    predictions = np.argmax(logits, axis=1)
     return {"accuracy": (predictions == labels).mean()}
+
 
 def tokenize_fn(examples):
     global tokenizer
@@ -112,7 +115,7 @@ def load_foundation_model():
 
     for name, param in model.named_parameters():
         if "score" not in name:  # Keep classification head trainable
-            param.requires_grad = False
+            param.requires_grad = True
 
     print(model)
 
@@ -120,25 +123,15 @@ def train_gpt2():
     global model, tokenizer, data_collator, label_names, id2label, label2id, device
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
 
-    # Check if classification head is initialized
-    if not any("score.weight" in name for name, _ in model.named_parameters()):
-        print("Skipping evaluation: Model head weights are uninitialized.")
-    else:
-        trainer = Trainer(
-            model=model,
-            eval_dataset=tokenized_ds["test"],
-            compute_metrics=compute_metrics,
-            tokenizer=tokenizer,
-            data_collator=data_collator,
-        )
-        print("Pretrained Model Evaluation:", trainer.evaluate())
+    for name, param in model.named_parameters():
+        print(name, param.requires_grad)
 
     gpt2_training_args = TrainingArguments(
         output_dir="./gpt2_output", 
         learning_rate=2e-5, 
         per_device_train_batch_size=16, 
         per_device_eval_batch_size=16, 
-        num_train_epochs=1, 
+        num_train_epochs=3, 
         weight_decay=0.01, 
         eval_strategy="epoch",
         save_strategy="epoch", 
@@ -172,6 +165,10 @@ def train_lora():
     tokenizer = AutoTokenizer.from_pretrained(GPT2_FINETUNED_MODEL)
     model = AutoModelForSequenceClassification.from_pretrained(GPT2_FINETUNED_MODEL, ignore_mismatched_sizes=True).to(device)
 
+    # unfreeze parameters for training
+    for name, param in model.named_parameters():
+        if "score" in name:
+            param.requires_grad = True 
 
     lora_config = LoraConfig(r=8, lora_alpha=16, lora_dropout=0.1, bias="none", task_type=TaskType.SEQ_CLS)
     peft_model = get_peft_model(model, lora_config)
@@ -187,7 +184,7 @@ def train_lora():
             num_train_epochs=2,
             weight_decay=0.01,
             eval_strategy="epoch",
-            metric_for_best_model="eval_accuracy",  # Change from "accuracy" to "eval_accuracy"
+            metric_for_best_model="accuracy",  # Change from "accuracy" to "eval_accuracy"
             save_strategy="epoch",
             load_best_model_at_end=True,
             label_names=label_names,
@@ -198,6 +195,8 @@ def train_lora():
         data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
+    metrics = lora_trainer.evaluate()
+    print("Evaluation Metrics:", metrics)
     lora_trainer.train()
     lora_results = lora_trainer.evaluate()
     print("Evaluation results before fine-tuning:", lora_results)
