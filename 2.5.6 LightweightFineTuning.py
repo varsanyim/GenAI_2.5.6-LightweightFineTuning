@@ -187,7 +187,7 @@ def train_lora():
             num_train_epochs=2,
             weight_decay=0.01,
             eval_strategy="epoch",
-            metric_for_best_model="accuracy",  # Change from "eval_loss" to "accuracy"
+            metric_for_best_model="eval_accuracy",  # Change from "accuracy" to "eval_accuracy"
             save_strategy="epoch",
             load_best_model_at_end=True,
             label_names=label_names,
