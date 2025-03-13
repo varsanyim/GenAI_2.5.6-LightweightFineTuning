@@ -6,17 +6,6 @@ Creation Time: 2025.03.12
 GenAI Course 2, 5.6 LightweightFineTuning
 
 Purpose: This script demonstrates the process of loading, training, and evaluating a GPT-2 model for sequence classification using parameter-efficient fine-tuning techniques such as LoRA (Low-Rank Adaptation) and PEFT (Parameter-Efficient Fine-Tuning). The script includes functions for loading the foundation model, training the GPT-2 model, performing LoRA fine-tuning, and performing PEFT fine-tuning. It also includes utility functions for tokenization, metric computation, and time conversion.
-Functions:
-- secToHuman(elapsed_time): Converts elapsed time in seconds to a human-readable format (HH:MM:SS).
-- compute_metrics(eval_pred): Computes accuracy metrics for evaluation predictions.
-- tokenize_fn(examples): Tokenizes input examples using the GPT-2 tokenizer.
-- load_foiundation_model(): Loads and prepares the GPT-2 foundation model for sequence classification.
-- train_gpt2(): Trains the GPT-2 model on the tokenized dataset and evaluates its performance.
-- train_lora(): Performs LoRA fine-tuning on the GPT-2 model and evaluates its performance.
-- train_peft(): Performs PEFT fine-tuning on the LoRA fine-tuned model and evaluates its performance.
-Usage:
-- Run the script with the argument 'run_all' to perform all training steps and save the fine-tuned models.
-- The script will skip training steps if the corresponding model directories already exist.
 """
 
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments, DataCollatorWithPadding
@@ -49,6 +38,7 @@ def tokenize_fn(examples):
     return tokenizer(examples["sms"], padding="max_length", truncation=True, max_length=256)
 
 # variables
+CHECKPOINTS = "./checkpoints"
 GPT2_FINETUNED_MODEL = "./gpt2_tuned_model"
 LORA_FINETUNED_MODEL = "./lora_tuned_model"
 PEFT_FINETUNED_MODEL = "./peft_tuned_model"
@@ -57,6 +47,7 @@ label_names = ["not spam", "spam"]
 id2label = {idx: label for idx, label in enumerate(label_names)}
 label2id = {label: idx for idx, label in enumerate(label_names)}
 model = None
+peft_model = None
 tokenizer = None
 data_collator = None
 tokenized_ds = {} 
@@ -71,7 +62,11 @@ def load_foundation_model():
     split = ['train', 'test']
 
     raw_dataset = load_dataset("sms_spam")
-    dataset = raw_dataset['train'].train_test_split(test_size=0.2, seed=42, shuffle=True)
+    full_dataset = raw_dataset['train'].train_test_split(test_size=0.2, seed=42, shuffle=True)
+    
+    dataset =  {"train": full_dataset["train"].shuffle(seed=42).select(range(1000)),  # Keep only 1000 samples
+                "test":  full_dataset["test"].shuffle(seed=42).select(range(200))  # Keep only 200 samples
+                }
 
     # Load GPT-2 tokenizer and model
     model_name = "gpt2"
@@ -126,22 +121,22 @@ def train_gpt2():
     for name, param in model.named_parameters():
         print(name, param.requires_grad)
 
-    gpt2_training_args = TrainingArguments(
-        output_dir="./gpt2_output", 
-        learning_rate=2e-5, 
-        per_device_train_batch_size=16, 
-        per_device_eval_batch_size=16, 
-        num_train_epochs=3, 
-        weight_decay=0.01, 
-        eval_strategy="epoch",
-        save_strategy="epoch", 
-        metric_for_best_model="accuracy",  # Change from "eval_loss" to "accuracy"
-        load_best_model_at_end=True, 
-    )
 
     gpt2_trainer = Trainer(
         model=model,
-        args=gpt2_training_args,
+        args=TrainingArguments(
+            output_dir=CHECKPOINTS, 
+            resume_from_checkpoint=True,
+            learning_rate=2e-5, 
+            per_device_train_batch_size=16, 
+            per_device_eval_batch_size=16, 
+            num_train_epochs=3, 
+            weight_decay=0.01, 
+            eval_strategy="epoch",
+            save_strategy="epoch", 
+            metric_for_best_model="accuracy",  # Change from "eval_loss" to "accuracy"
+            load_best_model_at_end=True, 
+        ),
         train_dataset=tokenized_ds["train"],
         eval_dataset=tokenized_ds["test"], 
         tokenizer=tokenizer,
@@ -150,25 +145,25 @@ def train_gpt2():
     )
 
     gpt2_trainer.train()
-    gpt2_results = gpt2_trainer.evaluate()
-    print("Evaluation results before fine-tuning:", gpt2_results)
-    gpt2_trainer.save_model(GPT2_FINETUNED_MODEL)  
-    tokenizer.save_pretrained(GPT2_FINETUNED_MODEL)
+    gpt2_metrics = gpt2_trainer.evaluate()
+    print("Evaluation results before ine-tuning:", gpt2_metrics)
+    # gpt2_trainer.save_model(GPT2_FINETUNED_MODEL)  
+    # gpt2_trainer.save_state()
+    # gpt2_trainer.save_metrics("eval", gpt2_metrics)
+
+    # tokenizer.save_pretrained(GPT2_FINETUNED_MODEL)
 
 ###############################################################################
 # Performing Parameter-Efficient Fine-Tuning
 ###############################################################################
 
+import json
 def train_lora():
-    global model, tokenizer, data_collator, label_names, id2label, label2id, device
+    global model, peft_model, tokenizer, data_collator, label_names, id2label, label2id, device
 
-    tokenizer = AutoTokenizer.from_pretrained(GPT2_FINETUNED_MODEL)
-    model = AutoModelForSequenceClassification.from_pretrained(GPT2_FINETUNED_MODEL, ignore_mismatched_sizes=True).to(device)
-
-    # unfreeze parameters for training
-    for name, param in model.named_parameters():
-        if "score" in name:
-            param.requires_grad = True 
+    # tokenizer = AutoTokenizer.from_pretrained(GPT2_FINETUNED_MODEL)
+    # model = AutoModelForSequenceClassification.from_pretrained(GPT2_FINETUNED_MODEL, ignore_mismatched_sizes=True).to(device)
+    model.to(device)
 
     lora_config = LoraConfig(r=8, lora_alpha=16, lora_dropout=0.1, bias="none", task_type=TaskType.SEQ_CLS)
     peft_model = get_peft_model(model, lora_config)
@@ -177,14 +172,15 @@ def train_lora():
     lora_trainer = Trainer(
         model=peft_model,  # Make sure to pass the PEFT model here
         args=TrainingArguments(
-            output_dir="./lora_output",
+            output_dir=CHECKPOINTS,
+            resume_from_checkpoint=True,
             learning_rate=2e-5,
             per_device_train_batch_size=32,
             per_device_eval_batch_size=32,
-            num_train_epochs=2,
+            num_train_epochs=3,
             weight_decay=0.01,
             eval_strategy="epoch",
-            metric_for_best_model="accuracy",  # Change from "accuracy" to "eval_accuracy"
+            metric_for_best_model="eval_loss",  
             save_strategy="epoch",
             load_best_model_at_end=True,
             label_names=label_names,
@@ -197,9 +193,13 @@ def train_lora():
     )
     metrics = lora_trainer.evaluate()
     print("Evaluation Metrics:", metrics)
-    lora_trainer.train()
-    lora_results = lora_trainer.evaluate()
-    print("Evaluation results before fine-tuning:", lora_results)
+    lora_trainer.train() # resume_from_checkpoint=CHECKPOINTS+"/checkpoint-last")
+    lora_metrics = lora_trainer.evaluate()
+    print("Evaluation results before fine-tuning:", lora_metrics)
+
+    lora_trainer.save_model(LORA_FINETUNED_MODEL)  
+    lora_trainer.save_state()
+    lora_trainer.save_metrics("eval", lora_metrics)
 
     # Save fine-tuned model
     peft_model.save_pretrained(LORA_FINETUNED_MODEL)
@@ -209,39 +209,41 @@ def train_lora():
 # Performing Inference with a PEFT Model
 ###############################################################################
 def train_peft():
-    global model, tokenizer, data_collator, label_names, id2label, label2id, device
+    global model, peft_model, tokenizer, data_collator, label_names, id2label, label2id, device
     NUM_LABELS = 2
 
-    tokenizer = AutoTokenizer.from_pretrained(LORA_FINETUNED_MODEL)
-    peft_model = AutoPeftModelForSequenceClassification.from_pretrained(LORA_FINETUNED_MODEL, num_labels=NUM_LABELS, ignore_mismatched_sizes=True).to(device)
+    model.to(device)
+    peft_model = model  # Rename because compatibility 
+    # tokenizer = AutoTokenizer.from_pretrained(LORA_FINETUNED_MODEL)
+    # peft_model = AutoPeftModelForSequenceClassification.from_pretrained(LORA_FINETUNED_MODEL, num_labels=NUM_LABELS, ignore_mismatched_sizes=True).to(device)
     peft_model.config.pad_token_id = tokenizer.pad_token_id
-
-    hf_training_args = TrainingArguments(
-        output_dir="./peft_output", 
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        logging_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="accuracy",  # ✅ Move here
-    )
 
     hf_trainer = Trainer(
         model=peft_model,  # PEFT model
-        args=hf_training_args,
+        args=TrainingArguments(
+            output_dir=CHECKPOINTS, 
+            resume_from_checkpoint=True,
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
+            logging_strategy="epoch",
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss", 
+        ),
         train_dataset=tokenized_ds["train"],
         eval_dataset=tokenized_ds["test"],
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
     )
 
+    # hf_trainer.train(resume_from_checkpoint=CHECKPOINTS+"/checkpoint-last")
+
     # Save fine-tuned model
     peft_model.save_pretrained(PEFT_FINETUNED_MODEL)
     tokenizer.save_pretrained(PEFT_FINETUNED_MODEL)  
 
-
     # Evaluate the fine-tuned model on the test set
     hf_results = hf_trainer.evaluate()
-    with open(os.path.join(PEFT_FINETUNED_MODEL, "evaluation_results.txt"), "w") as f:
+    with open("./evaluation_results.txt", "w") as f:
         f.write(str(hf_results))
     print("Evaluation results for the fine-tuned model:", hf_results)
 
